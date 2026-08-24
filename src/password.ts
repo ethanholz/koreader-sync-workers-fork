@@ -1,4 +1,4 @@
-const iterations = 600_000;
+const iterations = 100_000;
 const encoder = new TextEncoder();
 
 const toBase64 = (value: Uint8Array) =>

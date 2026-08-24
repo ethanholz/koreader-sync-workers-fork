@@ -66,7 +66,7 @@ Use the deployed `workers.dev` URL, or attach a custom domain in the Cloudflare 
 | `DISABLE_USER_REGISTRATION` | `"false"` | Set to `"true"` in `wrangler.jsonc` to block registration |
 | `AUTH_RATE_LIMITER` | 10/minute | Cloudflare rate-limit binding for user endpoints |
 
-Passwords are stored using PBKDF2-HMAC-SHA256 with a random per-user salt and the `PASSWORD_SALT` secret as a pepper. Keep that secret stable: changing it invalidates existing passwords. The secure PBKDF2 work factor should be checked against your Workers plan's CPU limit before production use.
+Passwords are stored using PBKDF2-HMAC-SHA256 with Cloudflare's maximum supported work factor of 100,000 iterations, a random per-user salt, and the `PASSWORD_SALT` secret as a pepper. Keep that secret stable: changing it invalidates existing passwords.
 
 ## API
 
