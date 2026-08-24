@@ -684,7 +684,7 @@ app.get("/", (c) => {
                 }}
               >
                 <a
-                  href="https://github.com/nperez0111/koreader-sync"
+                  href="https://github.com/ethanholz/workers-koreader-sync"
                   target="_blank"
                   rel="noopener noreferrer"
                   style={{
