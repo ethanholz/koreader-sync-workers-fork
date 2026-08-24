@@ -1,6 +1,10 @@
-# deps
 node_modules/
 .env
+.env.*
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+.wrangler/
+dist/
 *.db
-server.js
 .DS_Store

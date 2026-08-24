@@ -1,12 +1,10 @@
-import { Database } from "bun:sqlite";
 import { Hono } from "hono";
-import { serveStatic } from "hono/bun";
 import { HTTPException } from "hono/http-exception";
 import { requestId } from "hono/request-id";
 import type { RequestIdVariables } from "hono/request-id";
 import { secureHeaders } from "hono/secure-headers";
 import type { Context, Next } from "hono";
-import pino from "pino";
+import { hashPassword, verifyPassword } from "./password";
 
 // =============================================================================
 // Types
@@ -16,7 +14,6 @@ interface User {
   id: number;
   username: string;
   password: string;
-  created_at: Date;
 }
 
 interface DocumentMetadata {
@@ -57,171 +54,42 @@ interface ProgressUpdateRequest {
 // Config
 // =============================================================================
 
-interface Config {
-  password: {
-    salt: string;
-  };
-  auth: {
-    disableUserRegistration: boolean;
-  };
-  server: {
-    port: number;
-    host: string;
-  };
-}
+type Variables = {
+  userId: number;
+} & RequestIdVariables;
 
-const config: Config = {
-  password: {
-    salt: process.env.PASSWORD_SALT || "default_salt_change_in_production",
-  },
-  auth: {
-    disableUserRegistration:
-      process.env.DISABLE_USER_REGISTRATION?.toLowerCase() === "true",
-  },
-  server: {
-    port: Number(process.env.PORT) || 3000,
-    host: process.env.HOST || "0.0.0.0",
-  },
+type AppEnv = {
+  Bindings: Env;
+  Variables: Variables;
 };
 
 // =============================================================================
 // Logger
 // =============================================================================
 
-const logger = pino({
-  level: process.env.LOG_LEVEL || "info",
-  transport:
-    process.env.NODE_ENV === "development"
-      ? {
-          target: "pino-pretty",
-          options: {
-            colorize: true,
-            translateTime: "SYS:standard",
-            ignore: "pid,hostname",
-          },
-        }
-      : undefined,
-  serializers: {
-    req: (req: any) => ({
-      method: req.method,
-      url: req.url,
-      headers: req.headers
-        ? {
-            "user-agent": req.headers["user-agent"],
-            "content-type": req.headers["content-type"],
-            authorization: req.headers["authorization"]
-              ? "[REDACTED]"
-              : undefined,
-          }
-        : undefined,
-    }),
-    res: (res: any) => ({
-      statusCode: res.statusCode,
-      headers: res.headers
-        ? {
-            "content-type": res.headers["content-type"],
-          }
-        : undefined,
-    }),
-  },
-});
-
-// =============================================================================
-// Database
-// =============================================================================
-
-const db = new Database("data/koreader-sync.db", {
-  create: true,
-});
-
-db.run(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
-`);
-
-db.run(`
-  CREATE TABLE IF NOT EXISTS progress (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    document TEXT NOT NULL,
-    progress TEXT NOT NULL,
-    percentage REAL NOT NULL,
-    device TEXT NOT NULL,
-    device_id TEXT NOT NULL,
-    filename TEXT,
-    title TEXT,
-    authors TEXT,
-    timestamp INTEGER NOT NULL,
-    FOREIGN KEY(user_id) REFERENCES users(id),
-    UNIQUE(user_id, document)
-  )
-`);
-
-// Migrate existing databases to include metadata columns
-const progressColumns = db
-  .prepare(`PRAGMA table_info(progress)`)
-  .all() as { name: string }[];
-const existingColumnNames = new Set(progressColumns.map((c) => c.name));
-for (const column of ["filename", "title", "authors"]) {
-  if (!existingColumnNames.has(column)) {
-    db.run(`ALTER TABLE progress ADD COLUMN ${column} TEXT`);
-  }
-}
-
-db.run(
-  `CREATE INDEX IF NOT EXISTS idx_progress_document ON progress(document)`
-);
-db.run(`CREATE INDEX IF NOT EXISTS idx_progress_user_id ON progress(user_id)`);
+const logger = console;
 
 // =============================================================================
 // Rate Limiter
 // =============================================================================
 
-interface RateLimitOptions {
-  windowMs: number;
-  max: number;
-}
-
-function rateLimiter({ windowMs, max }: RateLimitOptions) {
-  const hits = new Map<string, { count: number; resetAt: number }>();
-
-  setInterval(() => {
-    const now = Date.now();
-    for (const [key, entry] of hits) {
-      if (now >= entry.resetAt) hits.delete(key);
-    }
-  }, windowMs);
-
-  return async (c: Context, next: Next) => {
-    const key =
-      c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ??
-      c.req.header("x-real-ip") ??
-      "unknown";
-    const now = Date.now();
-    const entry = hits.get(key);
-
-    if (!entry || now >= entry.resetAt) {
-      hits.set(key, { count: 1, resetAt: now + windowMs });
-    } else {
-      entry.count++;
-      if (entry.count > max) {
-        throw new HTTPException(429, { message: "Too many requests" });
-      }
-    }
-
-    await next();
-  };
-}
+const authRateLimit = async (c: Context<AppEnv>, next: Next) => {
+  const key =
+    c.req.header("x-auth-user") ??
+    c.req.header("cf-connecting-ip") ??
+    "unknown";
+  const { success } = await c.env.AUTH_RATE_LIMITER.limit({ key });
+  if (!success) {
+    throw new HTTPException(429, { message: "Too many requests" });
+  }
+  await next();
+};
 
 // =============================================================================
 // Middleware
 // =============================================================================
 
-const loggingMiddleware = async (c: Context, next: Next) => {
+const loggingMiddleware = async (c: Context<AppEnv>, next: Next) => {
   const start = Date.now();
   const { method, url } = c.req;
   const requestId = c.get("requestId");
@@ -270,7 +138,7 @@ const loggingMiddleware = async (c: Context, next: Next) => {
   }
 };
 
-const errorHandler = (error: Error, c: Context) => {
+const errorHandler = (error: Error, c: Context<AppEnv>) => {
   if (error instanceof HTTPException) {
     return error.getResponse();
   }
@@ -296,14 +164,7 @@ const errorHandler = (error: Error, c: Context) => {
 // Auth
 // =============================================================================
 
-type AuthVariables = {
-  userId: number;
-};
-
-async function authMiddleware(
-  c: Context<{ Variables: AuthVariables }>,
-  next: Next
-) {
+async function authMiddleware(c: Context<AppEnv>, next: Next) {
   const username = c.req.header("x-auth-user");
   const password = c.req.header("x-auth-key");
   const requestId = c.get("requestId");
@@ -318,12 +179,15 @@ async function authMiddleware(
     throw new HTTPException(401, { message: "Authentication required" });
   }
 
-  const user = db
+  const user = await c.env.DB
     .prepare("SELECT id, username, password FROM users WHERE username = ?")
-    .get(username) as User | null;
+    .bind(username)
+    .first<User>();
 
-  const saltedPassword = password + config.password.salt;
-  if (!user || !(await Bun.password.verify(saltedPassword, user.password))) {
+  if (
+    !user ||
+    !(await verifyPassword(password, user.password, c.env.PASSWORD_SALT))
+  ) {
     logger.warn(
       { requestId, username },
       "Authentication failed: invalid credentials"
@@ -343,11 +207,7 @@ async function authMiddleware(
 // App
 // =============================================================================
 
-type Variables = {
-  userId: number;
-} & RequestIdVariables;
-
-const app = new Hono<{ Variables: Variables }>();
+const app = new Hono<AppEnv>();
 
 // Add secure headers middleware
 app.use(
@@ -380,7 +240,6 @@ app.use("*", loggingMiddleware);
 app.onError(errorHandler);
 
 // Rate limit auth-related endpoints
-const authRateLimit = rateLimiter({ windowMs: 60_000, max: 10 });
 app.use("/users/*", authRateLimit);
 
 // Register endpoint
@@ -394,7 +253,7 @@ app.post("/users/create", async (c) => {
     throw new HTTPException(400, { message: "Invalid JSON body" });
   }
 
-  if (config.auth.disableUserRegistration) {
+  if (c.env.DISABLE_USER_REGISTRATION.toLowerCase() === "true") {
     logger.warn({ requestId }, "Registration disabled by configuration");
     throw new HTTPException(403, {
       message: "User registration is disabled",
@@ -422,13 +281,16 @@ app.post("/users/create", async (c) => {
     });
   }
 
+  const hashedPassword = await hashPassword(
+    body.password,
+    c.env.PASSWORD_SALT
+  );
+
   try {
-    const saltedPassword = body.password + config.password.salt;
-    const hashedPassword = await Bun.password.hash(saltedPassword);
-    db.prepare("INSERT INTO users (username, password) VALUES (?, ?)").run(
-      body.username,
-      hashedPassword
-    );
+    await c.env.DB
+      .prepare("INSERT INTO users (username, password) VALUES (?, ?)")
+      .bind(body.username, hashedPassword)
+      .run();
 
     logger.info(
       { requestId, username: body.username },
@@ -503,7 +365,7 @@ app.put("/syncs/progress", authMiddleware, async (c) => {
   const authors = metadata?.authors ?? null;
 
   try {
-    db.prepare(
+    await c.env.DB.prepare(
       `
       INSERT INTO progress (
         user_id,
@@ -528,18 +390,20 @@ app.put("/syncs/progress", authMiddleware, async (c) => {
         authors = COALESCE(excluded.authors, progress.authors),
         timestamp = excluded.timestamp
     `
-    ).run(
-      userId as number,
-      document,
-      progress,
-      percentage,
-      device,
-      device_id,
-      filename,
-      title,
-      authors,
-      timestamp
-    );
+    )
+      .bind(
+        userId,
+        document,
+        progress,
+        percentage,
+        device,
+        device_id,
+        filename,
+        title,
+        authors,
+        timestamp
+      )
+      .run();
 
     logger.info(
       {
@@ -570,7 +434,7 @@ app.put("/syncs/progress", authMiddleware, async (c) => {
 });
 
 // Get progress endpoint
-app.get("/syncs/progress/:document", authMiddleware, (c) => {
+app.get("/syncs/progress/:document", authMiddleware, async (c) => {
   const userId = c.get("userId");
   const requestId = c.get("requestId");
   const document = c.req.param("document");
@@ -578,7 +442,7 @@ app.get("/syncs/progress/:document", authMiddleware, (c) => {
   logger.info({ requestId, userId, document }, "Progress retrieval requested");
 
   try {
-    const progress = db
+    const progress = await c.env.DB
       .prepare(
         `
       SELECT progress, percentage, device, device_id, timestamp
@@ -588,10 +452,13 @@ app.get("/syncs/progress/:document", authMiddleware, (c) => {
       LIMIT 1
     `
       )
-      .get(userId as number, document) as Pick<
-      Progress,
-      "progress" | "percentage" | "device" | "device_id" | "timestamp"
-    > | null;
+      .bind(userId, document)
+      .first<
+        Pick<
+          Progress,
+          "progress" | "percentage" | "device" | "device_id" | "timestamp"
+        >
+      >();
 
     if (!progress) {
       logger.info({ requestId, userId, document }, "Progress not found");
@@ -625,14 +492,14 @@ app.get("/syncs/progress/:document", authMiddleware, (c) => {
 });
 
 // List all synced documents with metadata for the authenticated user
-app.get("/syncs/documents", authMiddleware, (c) => {
+app.get("/syncs/documents", authMiddleware, async (c) => {
   const userId = c.get("userId");
   const requestId = c.get("requestId");
 
   logger.info({ requestId, userId }, "Documents list requested");
 
   try {
-    const documents = db
+    const { results: documents } = await c.env.DB
       .prepare(
         `
       SELECT document, progress, percentage, device, device_id,
@@ -642,7 +509,8 @@ app.get("/syncs/documents", authMiddleware, (c) => {
       ORDER BY timestamp DESC
     `
       )
-      .all(userId as number);
+      .bind(userId)
+      .all<Progress>();
 
     logger.info(
       { requestId, userId, count: documents.length },
@@ -676,14 +544,14 @@ app.get("/", (c) => {
         <meta charset="UTF-8" />
         <meta
           name="description"
-          content="A self-hostable sync server for KOReader. Keeps reading progress in sync across all your devices."
+          content="A Cloudflare Workers sync server for KOReader. Keeps reading progress in sync across all your devices."
         />
         <meta property="og:title" content="KOReader Sync Server" />
         <meta
           property="og:description"
-          content="A self-hostable sync server for KOReader. Keeps reading progress in sync across all your devices."
+          content="A Cloudflare Workers sync server for KOReader. Keeps reading progress in sync across all your devices."
         />
-        <meta property="og:image" content="/public/logo.jpg" />
+        <meta property="og:image" content="/logo.jpg" />
         <meta property="og:type" content="website" />
         <meta property="og:site_name" content="KOReader Sync Server" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -691,21 +559,21 @@ app.get("/", (c) => {
         <link
           rel="apple-touch-icon"
           sizes="180x180"
-          href="/public/apple-touch-icon.png"
+          href="/apple-touch-icon.png"
         />
         <link
           rel="icon"
           type="image/png"
           sizes="32x32"
-          href="/public/favicon-32x32.png"
+          href="/favicon-32x32.png"
         />
         <link
           rel="icon"
           type="image/png"
           sizes="16x16"
-          href="/public/favicon-16x16.png"
+          href="/favicon-16x16.png"
         />
-        <link rel="manifest" href="/public/site.webmanifest" />
+        <link rel="manifest" href="/site.webmanifest" />
         <title>KOReader Sync Server</title>
         <style>{`
           :root {
@@ -787,8 +655,8 @@ app.get("/", (c) => {
                   color: "var(--color-text-muted)",
                 }}
               >
-                A self-hostable sync server for KOReader. Keeps reading progress
-                in sync across all your devices.
+                A Cloudflare Workers sync server for KOReader. Keeps reading
+                progress in sync across all your devices.
               </p>
 
               <ul
@@ -802,8 +670,8 @@ app.get("/", (c) => {
                 <li>
                   Less than 1,000 lines of TypeScript in a single file
                 </li>
-                <li>SQLite database — no external services needed</li>
-                <li>Runs on Docker — nothing else to install</li>
+                <li>Cloudflare D1 database</li>
+                <li>Runs globally on Cloudflare Workers</li>
               </ul>
 
               <p
@@ -840,7 +708,7 @@ app.get("/", (c) => {
               }}
             >
               <img
-                src="/public/logo.jpg"
+                src="/logo.jpg"
                 alt="KOReader Sync Server"
                 style={{
                   width: "100%",
@@ -871,72 +739,10 @@ app.get("/", (c) => {
             </li>
           </ol>
 
-          <h2>Self-Hosting</h2>
+          <h2>Deployment</h2>
           <p>
-            <strong>Requirements:</strong> Docker. That's it.
-          </p>
-
-          <h3 style={{ fontSize: "1.1rem" }}>Quick Start</h3>
-          <div
-            style={{
-              backgroundColor: "var(--color-code-bg)",
-              padding: "1rem",
-              borderRadius: "0.5rem",
-              overflow: "auto",
-              marginBottom: "1rem",
-            }}
-          >
-            <pre
-              style={{
-                color: "var(--color-code-text)",
-                margin: 0,
-                fontFamily: "monospace",
-              }}
-            >
-              {`docker run -d -p 3000:3000 -v koreader-data:/app/data ghcr.io/nperez0111/koreader-sync:latest`}
-            </pre>
-          </div>
-          <p>
-            The server is now running at <code>http://localhost:3000</code>.
-            The SQLite database is persisted in the{" "}
-            <code>koreader-data</code> volume.
-          </p>
-
-          <h3 style={{ fontSize: "1.1rem" }}>Docker Compose</h3>
-          <p>For a more permanent setup:</p>
-          <div
-            style={{
-              backgroundColor: "var(--color-code-bg)",
-              padding: "1rem",
-              borderRadius: "0.5rem",
-              overflow: "auto",
-              marginBottom: "1rem",
-            }}
-          >
-            <pre
-              style={{
-                color: "var(--color-code-text)",
-                margin: 0,
-                fontFamily: "monospace",
-              }}
-            >
-              {`services:
-  kosync:
-    image: ghcr.io/nperez0111/koreader-sync:latest
-    container_name: kosync
-    ports:
-      - 3000:3000
-    restart: unless-stopped
-    volumes:
-      - data:/app/data
-
-volumes:
-  data:`}
-            </pre>
-          </div>
-          <p>
-            Save as <code>docker-compose.yml</code> and run{" "}
-            <code>docker compose up -d</code>.
+            This server runs on Cloudflare Workers and stores its data in D1.
+            See the project README for setup and deployment instructions.
           </p>
 
           <p
@@ -956,23 +762,5 @@ volumes:
     </html>
   );
 });
-
-app.use(
-  "/public/*",
-  serveStatic({
-    root: "./public",
-    rewriteRequestPath: (path) => path.replace(/^\/public/, ""),
-    mimes: {
-      css: "text/css",
-      svg: "image/svg+xml",
-      jpg: "image/jpeg",
-      mp4: "video/mp4",
-      woff2: "font/woff2",
-    },
-  })
-);
-
-// Log startup
-logger.info("KOReader Sync Server starting up");
 
 export default app;
