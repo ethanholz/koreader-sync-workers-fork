@@ -4,116 +4,89 @@
   <img src="./public/logo.jpg" alt="KOReader Sync Server" width="150">
 </div>
 
-A self-hostable sync server for [KOReader](https://koreader.rocks/). Keeps reading progress in sync across all your devices.
+A KOReader progress sync server built for Cloudflare Workers and D1.
 
-[![Build](https://github.com/nperez0111/koreader-sync/actions/workflows/docker-build.yml/badge.svg)](https://github.com/nperez0111/koreader-sync/actions/workflows/docker-build.yml)
-[![License: MIT](https://img.shields.io/github/license/nperez0111/koreader-sync)](LICENSE)
-[![GitHub release](https://img.shields.io/github/v/release/nperez0111/koreader-sync)](https://github.com/nperez0111/koreader-sync/releases)
+## Requirements
 
-- Less than 1,000 lines of TypeScript in a single file (`src/index.tsx`)
-- SQLite database — no external services needed
-- Runs on Docker — nothing else to install
+- Node.js 22 or newer
+- A Cloudflare account
 
-**Requirements:** Docker. That's it.
+## Setup
 
-## Quick Start
-
-```bash
-docker run -d -p 3000:3000 -v koreader-data:/app/data ghcr.io/nperez0111/koreader-sync:latest
+```sh
+npm install
+npx wrangler login
+npx wrangler d1 create koreader-sync
 ```
 
-The server is now running at `http://localhost:3000`. The SQLite database is persisted in the `koreader-data` volume.
+Copy the `database_id` printed by Wrangler into `wrangler.jsonc`, replacing `replace-with-d1-database-id`.
 
-For a more permanent setup, use Docker Compose:
+Create a password pepper for local development:
 
-```yaml
-# docker-compose.yml
-services:
-  kosync:
-    image: ghcr.io/nperez0111/koreader-sync:latest
-    container_name: kosync
-    ports:
-      - 3000:3000
-    restart: unless-stopped
-    volumes:
-      - data:/app/data
-
-volumes:
-  data:
+```sh
+cp .dev.vars.example .dev.vars
 ```
 
-```bash
-docker compose up -d
+Replace the example value in `.dev.vars`, then initialize the local database and start the Worker:
+
+```sh
+npm run db:migrate:local
+npm run dev
 ```
+
+The local server URL is printed by Wrangler.
+
+## Deploy
+
+Set the production password pepper, apply the D1 migration, and deploy:
+
+```sh
+npx wrangler secret put PASSWORD_SALT
+npm run db:migrate
+npm run deploy
+```
+
+Use the deployed `workers.dev` URL, or attach a custom domain in the Cloudflare dashboard.
 
 ## Connecting KOReader
 
-1. Open a document on your KOReader device
-2. Go to Settings > Progress Sync > Custom sync server
-3. Enter your server's URL (e.g., `http://your-server:3000`)
-4. Select "Register / Login" to create an account
-5. Test with "Push progress from this device now"
-6. Enable automatic progress syncing if desired
+1. Open a document in KOReader.
+2. Go to **Settings → Progress Sync → Custom sync server**.
+3. Enter the Worker URL.
+4. Select **Register / Login** to create an account.
+5. Test with **Push progress from this device now**.
+6. Enable automatic progress syncing if desired.
 
 ## Configuration
 
-All configuration is through environment variables. None are required — defaults work out of the box.
+| Binding | Default | Description |
+| --- | --- | --- |
+| `DB` | — | D1 database configured in `wrangler.jsonc` |
+| `PASSWORD_SALT` | — | Required secret pepper used for password hashing |
+| `DISABLE_USER_REGISTRATION` | `"false"` | Set to `"true"` in `wrangler.jsonc` to block registration |
+| `AUTH_RATE_LIMITER` | 10/minute | Cloudflare rate-limit binding for user endpoints |
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `3000` | Server port |
-| `HOST` | `0.0.0.0` | Bind address |
-| `PASSWORD_SALT` | `"default_salt_change_in_production"` | Salt for bcrypt password hashing. Change this in production. |
-| `DISABLE_USER_REGISTRATION` | `false` | Set to `true` to block new user registration |
-| `LOG_LEVEL` | `info` | Minimum log level: `debug`, `info`, `warn`, `error` |
-| `NODE_ENV` | — | Set to `development` for pretty-printed logs, otherwise JSON |
+Passwords are stored using PBKDF2-HMAC-SHA256 with a random per-user salt and the `PASSWORD_SALT` secret as a pepper. Keep that secret stable: changing it invalidates existing passwords. The secure PBKDF2 work factor should be checked against your Workers plan's CPU limit before production use.
 
-Pass them to Docker with `-e` flags or in your `docker-compose.yml`:
+## API
 
-```yaml
-services:
-  kosync:
-    image: ghcr.io/nperez0111/koreader-sync:latest
-    environment:
-      - PASSWORD_SALT=your_secure_random_string
-      - DISABLE_USER_REGISTRATION=true
-    # ...
-```
-
-## Security
-
-Built in:
-
-- Passwords are hashed with bcrypt (with configurable salt)
-- Rate limiting on auth endpoints (10 requests/min per IP)
-- Input validation on all endpoints (required fields, length limits)
-- Parameterized SQL queries (no injection risk)
-
-For production, you should also:
-
-- Put the server behind a reverse proxy with HTTPS (e.g., Caddy, Traefik, nginx)
-- Use a strong, random `PASSWORD_SALT`
-- Back up the SQLite database regularly (located at `/app/data/koreader-sync.db`)
-
-## API Endpoints
-
-### Register User
+### Register
 
 - **POST** `/users/create`
-- **Body**: `{ "username": "string", "password": "string" }`
-- **Response**: `201` Created, `409` Username exists, `403` Registration disabled
+- Body: `{ "username": "string", "password": "string" }`
+- Responses: `201`, `403`, `409`
 
 ### Authenticate
 
 - **GET** `/users/auth`
-- **Headers**: `x-auth-user`, `x-auth-key`
-- **Response**: `200` OK, `401` Unauthorized
+- Headers: `x-auth-user`, `x-auth-key`
+- Responses: `200`, `401`
 
-### Update Progress
+### Update progress
 
 - **PUT** `/syncs/progress`
-- **Headers**: `x-auth-user`, `x-auth-key`
-- **Body**:
+- Headers: `x-auth-user`, `x-auth-key`
+- Body:
 
 ```json
 {
@@ -130,54 +103,36 @@ For production, you should also:
 }
 ```
 
-The `metadata` field is optional. KOReader sends it when "Send document metadata" is enabled in KOSync settings (see [koreader/koreader#15306](https://github.com/koreader/koreader/pull/15306)). Previously stored metadata is preserved when omitted.
+`metadata` is optional. Previously stored metadata is preserved when omitted.
 
-- **Response**: `200` OK, `401` Unauthorized
-
-### Get Progress
+### Get progress
 
 - **GET** `/syncs/progress/:document`
-- **Headers**: `x-auth-user`, `x-auth-key`
-- **Response**: `200` OK with progress data, `404` Not found
+- Headers: `x-auth-user`, `x-auth-key`
+- Responses: `200`, `404`
 
-### List Documents
-
-Returns all synced documents for the authenticated user, ordered by most recently updated. This endpoint is not used by the KOReader client — it's available for building dashboards or browsing your library.
+### List documents
 
 - **GET** `/syncs/documents`
-- **Headers**: `x-auth-user`, `x-auth-key`
-- **Response**: `200` OK
+- Headers: `x-auth-user`, `x-auth-key`
 
-```json
-{
-  "documents": [
-    {
-      "document": "8b03a82761fae0ee6cd5a23700361e74",
-      "progress": "/body/DocFragment[15]/body/div[65]/text()[1].41",
-      "percentage": 0.2082,
-      "device": "boox",
-      "device_id": "197E7C6B3FD54A749C87DE9C1B05A3CE",
-      "filename": "the_great_gatsby.epub",
-      "title": "The Great Gatsby",
-      "authors": "F. Scott Fitzgerald",
-      "timestamp": 1703123456
-    }
-  ]
-}
-```
-
-`filename`, `title`, and `authors` are `null` for documents synced before metadata support was added.
-
-### Health Check
+### Health check
 
 - **GET** `/health`
-- **Response**: `200` `{"status": "ok"}`
 
-## Local Development
+## Migrating from the Bun version
 
-```bash
-bun install
-bun run dev
+D1 can import an SQL dump made from the existing SQLite database, but existing password hashes use Bun's default Argon2id format and cannot be verified by this Worker. Users need a password reset or an explicit Argon2 compatibility migration before imported accounts can authenticate.
+
+## Commands
+
+```sh
+npm run dev               # local Worker and D1
+npm run typecheck         # TypeScript check
+npm test                  # password hashing check
+npm run build             # Wrangler dry-run bundle
+npm run check             # typecheck, test, and build
+npm run db:migrate:local  # apply local D1 migrations
+npm run db:migrate        # apply production D1 migrations
+npm run deploy            # deploy to Cloudflare
 ```
-
-The dev server runs with hot reload. Create a `.env` file to configure environment variables locally (see [Configuration](#configuration)).
