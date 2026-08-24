@@ -15,7 +15,7 @@
     }
   ],
   "vars": {
-    "DISABLE_USER_REGISTRATION": "true"
+    "DISABLE_USER_REGISTRATION": "false"
   },
   "secrets": {
     "required": [
